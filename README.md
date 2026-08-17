@@ -55,6 +55,8 @@ clnurl = (import
   when the keys do not match. The public key is derived automatically when this option is omitted.
 * `clnurl_nostr_relays`: Optional comma-separated fallback relays. Receipts are always sent to the secure `wss://` relays
   requested by the zap sender as required by NIP-57.
+* `clnurl_nostr_proxy`: Optional SOCKS5 proxy for relay connections, written as `socks5h://host:port`. Relay hostnames are
+  resolved by the proxy. Authentication is not supported.
 * `clnurl_pay_index_path`: File used to persist the last CLN pay index examined by the receipt publisher. Defaults to
   `clnurl-zap-pay-index` beside the CLN RPC socket.
 
@@ -66,10 +68,12 @@ or 64-character hex secret, restrict it to the CLN user, and configure:
 ```text
 clnurl_nostr_secret_path=/run/keys/clnurl-nostr-secret
 clnurl_nostr_relays=wss://relay.example.com
+clnurl_nostr_proxy=socks5h://127.0.0.1:9050
 ```
 
-The extra relay is optional. Every valid zap request must provide at least one `wss://` relay, and `clnurl` publishes the
-receipt to those requested relays as well.
+The extra relay and proxy are optional. Every valid zap request must provide at least one `wss://` relay, and `clnurl`
+publishes the receipt to those requested relays as well. `socks5h` keeps relay DNS resolution inside the proxy, which is
+appropriate for a Tor-isolated CLN service that can only reach a local SOCKS port.
 
 When a signing key is configured, `clnurl` advertises `allowsNostr` and its derived `nostrPubkey`, validates kind `9734`
 requests, creates description-hash invoices, and watches CLN for settlement. A paid zap produces a signed kind `9735`

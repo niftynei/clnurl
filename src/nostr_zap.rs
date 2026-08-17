@@ -12,18 +12,55 @@ use futures::{SinkExt, StreamExt};
 use log::{debug, info, warn};
 use nostr::event::Event;
 use nostr::{ClientMessage, EventId, Keys, Kind, Tag, Timestamp, UnsignedEvent};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
+use tokio_socks::tcp::Socks5Stream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 use url::Url;
 
 const MAX_RELAYS: usize = 20;
 const RELAY_TIMEOUT: Duration = Duration::from_secs(10);
+const PROXY_RELAY_TIMEOUT: Duration = Duration::from_secs(30);
 const RELAY_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ValidatedZapRequest {
     receipt_tags: Vec<Tag>,
     pub relays: HashSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Socks5Proxy {
+    host: String,
+    port: u16,
+}
+
+impl Socks5Proxy {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        let url = Url::parse(value).context("invalid clnurl_nostr_proxy URL")?;
+        if url.scheme() != "socks5h" {
+            bail!("clnurl_nostr_proxy must use socks5h://");
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            bail!("clnurl_nostr_proxy does not support credentials");
+        }
+        if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+            bail!("clnurl_nostr_proxy must contain only a host and port");
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow!("clnurl_nostr_proxy has no host"))?;
+        let port = url.port().unwrap_or(1080);
+        Ok(Self {
+            host: host.to_owned(),
+            port,
+        })
+    }
+
+    fn address(&self) -> (&str, u16) {
+        (&self.host, self.port)
+    }
 }
 
 pub(crate) fn validate_zap_request(
@@ -215,6 +252,7 @@ pub(crate) async fn run_receipt_publisher(
     keys: Keys,
     pay_index_path: PathBuf,
     configured_relays: HashSet<String>,
+    proxy: Option<Socks5Proxy>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let mut last_pay_index = read_pay_index(&pay_index_path).unwrap_or_else(|err| {
@@ -266,7 +304,8 @@ pub(crate) async fn run_receipt_publisher(
                         relays.extend(request.relays.iter().cloned());
                         match create_zap_receipt(&keys, request, &invoice) {
                             Ok(receipt) => {
-                                let published = publish_receipt(&relays, &receipt).await;
+                                let published =
+                                    publish_receipt(&relays, proxy.as_ref(), &receipt).await;
                                 if published == 0 {
                                     warn!(
                                         "Zap receipt {} could not be sent to any relay",
@@ -315,10 +354,14 @@ async fn connect_cln(
     }
 }
 
-async fn publish_receipt(relays: &HashSet<String>, receipt: &Event) -> usize {
+async fn publish_receipt(
+    relays: &HashSet<String>,
+    proxy: Option<&Socks5Proxy>,
+    receipt: &Event,
+) -> usize {
     let futures = relays
         .iter()
-        .map(|relay| publish_with_retry(relay, receipt));
+        .map(|relay| publish_with_retry(relay, proxy, receipt));
     futures::future::join_all(futures)
         .await
         .into_iter()
@@ -326,9 +369,9 @@ async fn publish_receipt(relays: &HashSet<String>, receipt: &Event) -> usize {
         .count()
 }
 
-async fn publish_with_retry(relay: &str, receipt: &Event) -> bool {
+async fn publish_with_retry(relay: &str, proxy: Option<&Socks5Proxy>, receipt: &Event) -> bool {
     for attempt in 1..=RELAY_ATTEMPTS {
-        match publish_once(relay, receipt).await {
+        match publish_once(relay, proxy, receipt).await {
             Ok(()) => return true,
             Err(err) if attempt < RELAY_ATTEMPTS => {
                 warn!("Could not publish zap receipt to {relay} (attempt {attempt}): {err:#}");
@@ -340,11 +383,40 @@ async fn publish_with_retry(relay: &str, receipt: &Event) -> bool {
     false
 }
 
-async fn publish_once(relay: &str, receipt: &Event) -> Result<()> {
-    let connect = tokio_tungstenite::connect_async(relay);
-    let (mut socket, _) = tokio::time::timeout(RELAY_TIMEOUT, connect)
-        .await
-        .context("relay connection timed out")??;
+async fn publish_once(relay: &str, proxy: Option<&Socks5Proxy>, receipt: &Event) -> Result<()> {
+    if let Some(proxy) = proxy {
+        let relay_url = Url::parse(relay).context("invalid relay URL")?;
+        let relay_host = relay_url
+            .host_str()
+            .ok_or_else(|| anyhow!("relay URL has no host"))?;
+        let relay_port = relay_url
+            .port_or_known_default()
+            .ok_or_else(|| anyhow!("relay URL has no port"))?;
+        let connect = async {
+            let stream = Socks5Stream::connect(proxy.address(), (relay_host, relay_port))
+                .await
+                .context("SOCKS5 proxy connection failed")?;
+            tokio_tungstenite::client_async_tls(relay, stream)
+                .await
+                .context("relay TLS/WebSocket handshake failed")
+        };
+        let (socket, _) = tokio::time::timeout(PROXY_RELAY_TIMEOUT, connect)
+            .await
+            .context("relay connection through SOCKS5 proxy timed out")??;
+        publish_on_socket(socket, receipt).await
+    } else {
+        let connect = tokio_tungstenite::connect_async(relay);
+        let (socket, _) = tokio::time::timeout(RELAY_TIMEOUT, connect)
+            .await
+            .context("relay connection timed out")??;
+        publish_on_socket(socket, receipt).await
+    }
+}
+
+async fn publish_on_socket<S>(mut socket: WebSocketStream<S>, receipt: &Event) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let message = ClientMessage::new_event(receipt.clone()).as_json();
     tokio::time::timeout(RELAY_TIMEOUT, socket.send(Message::Text(message)))
         .await
@@ -508,5 +580,23 @@ mod tests {
             zapper.public_key(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn parses_socks5h_proxy_without_resolving_the_target_locally() {
+        assert_eq!(
+            Socks5Proxy::parse("socks5h://127.0.0.1:9050").unwrap(),
+            Socks5Proxy {
+                host: "127.0.0.1".to_owned(),
+                port: 9050,
+            }
+        );
+        assert_eq!(
+            Socks5Proxy::parse("socks5h://localhost").unwrap().port,
+            1080
+        );
+        assert!(Socks5Proxy::parse("socks5://127.0.0.1:9050").is_err());
+        assert!(Socks5Proxy::parse("http://127.0.0.1:9050").is_err());
+        assert!(Socks5Proxy::parse("socks5h://user:password@127.0.0.1:9050").is_err());
     }
 }

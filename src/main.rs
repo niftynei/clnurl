@@ -75,6 +75,11 @@ async fn main() -> anyhow::Result<()> {
             "Comma-separated additional relays to publish zap receipts to",
         ))
         .option(ConfigOption::new(
+            "clnurl_nostr_proxy",
+            Value::OptString,
+            "SOCKS5 proxy used for zap receipt relay connections (socks5h://host:port)",
+        ))
+        .option(ConfigOption::new(
             "clnurl_pay_index_path",
             Value::OptString,
             "File used to persist the last processed CLN pay index",
@@ -203,6 +208,12 @@ async fn main() -> anyhow::Result<()> {
             .expect("Option is a string"),
     )?;
 
+    let nostr_proxy = match plugin.option("clnurl_nostr_proxy") {
+        Some(Value::String(proxy)) => Some(nostr_zap::Socks5Proxy::parse(&proxy)?),
+        Some(Value::OptString) | None => None,
+        _ => None,
+    };
+
     let pay_index_path = match plugin.option("clnurl_pay_index_path") {
         Some(Value::String(path)) => PathBuf::from(path),
         Some(Value::OptString) | None => rpc_socket.with_file_name("clnurl-zap-pay-index"),
@@ -232,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
                 keys,
                 pay_index_path,
                 configured_relays,
+                nostr_proxy,
                 shutdown,
             )
             .await
