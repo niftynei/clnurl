@@ -1,4 +1,7 @@
 //! A mostly reverse-engineered implementation of LNURLPay following <https://bolt.fun/guide/web-services/lnurl/pay>
+mod nostr_zap;
+
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use axum::extract::{Query, State};
@@ -8,9 +11,10 @@ use axum::{Json, Router};
 use cln_plugin::options::{ConfigOption, Value};
 use cln_rpc::model::InvoiceRequest;
 use cln_rpc::primitives::{Amount, AmountOrAny};
-use nostr::event::Event;
+use nostr::key::FromSkStr;
 use nostr::prelude::FromBech32;
 use nostr::secp256k1::XOnlyPublicKey;
+use nostr::Keys;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -20,7 +24,8 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (shutdown_sender, mut shutdown_receiver) = tokio::sync::mpsc::channel::<()>(1);
+    let (shutdown_sender, _) = tokio::sync::broadcast::channel::<()>(1);
+    let plugin_shutdown_sender = shutdown_sender.clone();
     let plugin = if let Some(plugin) = cln_plugin::Builder::new(stdin(), stdout())
         .option(ConfigOption::new(
             "clnurl_listen",
@@ -52,16 +57,32 @@ async fn main() -> anyhow::Result<()> {
         .option(ConfigOption::new(
             "clnurl_nostr_pubkey",
             Value::OptString,
-            "Nostr pub key of zapper",
+            "Nostr public key used to sign zap receipts (must match clnurl_nostr_secret)",
+        ))
+        .option(ConfigOption::new(
+            "clnurl_nostr_secret",
+            Value::OptString,
+            "Dedicated Nostr secret key used to sign zap receipts (nsec or hex)",
+        ))
+        .option(ConfigOption::new(
+            "clnurl_nostr_secret_path",
+            Value::OptString,
+            "Path to a file containing the dedicated Nostr zap-receipt secret key",
+        ))
+        .option(ConfigOption::new(
+            "clnurl_nostr_relays",
+            Value::String("".into()),
+            "Comma-separated additional relays to publish zap receipts to",
+        ))
+        .option(ConfigOption::new(
+            "clnurl_pay_index_path",
+            Value::OptString,
+            "File used to persist the last processed CLN pay index",
         ))
         .subscribe("shutdown", move |_, _| {
-            let shutdown_sender_inner = shutdown_sender.clone();
+            let shutdown_sender_inner = plugin_shutdown_sender.clone();
             async move {
-                shutdown_sender_inner
-                    .send(())
-                    .await
-                    .expect("Shutdown signal received after main thread died");
-
+                let _ = shutdown_sender_inner.send(());
                 Ok(())
             }
         })
@@ -110,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("Option is a string")
         .to_owned();
 
-    let nostr_pubkey = match plugin.option("clnurl_nostr_pubkey") {
+    let configured_nostr_pubkey = match plugin.option("clnurl_nostr_pubkey") {
         Some(Value::String(pubkey)) => match XOnlyPublicKey::from_bech32(&pubkey) {
             Ok(pubkey) => Some(pubkey),
             Err(_) => Some(XOnlyPublicKey::from_str(&pubkey).expect("Invalid Zapper pubkey")),
@@ -120,6 +141,72 @@ async fn main() -> anyhow::Result<()> {
             // Something unexpected happened
             None
         }
+    };
+
+    let inline_nostr_secret = match plugin.option("clnurl_nostr_secret") {
+        Some(Value::String(secret)) => Some(secret),
+        _ => None,
+    };
+    let nostr_secret_path = match plugin.option("clnurl_nostr_secret_path") {
+        Some(Value::String(path)) => Some(PathBuf::from(path)),
+        _ => None,
+    };
+    anyhow::ensure!(
+        inline_nostr_secret.is_none() || nostr_secret_path.is_none(),
+        "Configure only one of clnurl_nostr_secret and clnurl_nostr_secret_path"
+    );
+    let nostr_secret = match (inline_nostr_secret, nostr_secret_path) {
+        (Some(secret), None) => Some(secret),
+        (None, Some(path)) => Some(
+            std::fs::read_to_string(&path)
+                .map_err(|err| anyhow::anyhow!("Could not read {}: {err}", path.display()))?
+                .trim()
+                .to_owned(),
+        ),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("checked above"),
+    };
+    let zapper_keys = match nostr_secret {
+        Some(secret) => Some(
+            Keys::from_sk_str(&secret)
+                .map_err(|err| anyhow::anyhow!("Invalid Nostr zapper secret: {err}"))?,
+        ),
+        None => None,
+    };
+
+    let nostr_pubkey = match &zapper_keys {
+        Some(keys) => {
+            let derived = keys.public_key();
+            if let Some(configured) = configured_nostr_pubkey {
+                anyhow::ensure!(
+                    configured == derived,
+                    "clnurl_nostr_pubkey does not match clnurl_nostr_secret"
+                );
+            }
+            Some(derived)
+        }
+        None => {
+            if configured_nostr_pubkey.is_some() {
+                log::warn!(
+                    "clnurl_nostr_pubkey is configured without clnurl_nostr_secret; Nostr zap support is disabled"
+                );
+            }
+            None
+        }
+    };
+
+    let configured_relays = parse_configured_relays(
+        plugin
+            .option("clnurl_nostr_relays")
+            .expect("Option is defined")
+            .as_str()
+            .expect("Option is a string"),
+    )?;
+
+    let pay_index_path = match plugin.option("clnurl_pay_index_path") {
+        Some(Value::String(path)) => PathBuf::from(path),
+        Some(Value::OptString) | None => rpc_socket.with_file_name("clnurl-zap-pay-index"),
+        _ => rpc_socket.with_file_name("clnurl-zap-pay-index"),
     };
 
     let state = ClnurlState {
@@ -134,10 +221,29 @@ async fn main() -> anyhow::Result<()> {
     let lnurl_service = Router::new()
         .route("/lnurl", get(get_lnurl_struct))
         .route("/invoice", get(get_invoice))
-        .with_state(state);
+        .with_state(state.clone());
+
+    let publisher = zapper_keys.map(|keys| {
+        let rpc_socket = state.rpc_socket.clone();
+        let shutdown = shutdown_sender.subscribe();
+        tokio::spawn(async move {
+            if let Err(err) = nostr_zap::run_receipt_publisher(
+                rpc_socket,
+                keys,
+                pay_index_path,
+                configured_relays,
+                shutdown,
+            )
+            .await
+            {
+                log::error!("Zap receipt publisher stopped: {err:#}");
+            }
+        })
+    });
 
     let shutdown_future = async move {
-        shutdown_receiver.recv().await;
+        let mut shutdown_receiver = shutdown_sender.subscribe();
+        let _ = shutdown_receiver.recv().await;
     };
 
     axum::Server::bind(&listen_addr)
@@ -145,7 +251,27 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_future)
         .await?;
 
+    if let Some(publisher) = publisher {
+        publisher.await?;
+    }
+
     Ok(())
+}
+
+fn parse_configured_relays(value: &str) -> anyhow::Result<HashSet<String>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|relay| !relay.is_empty())
+        .map(|relay| {
+            let url = Url::parse(relay)?;
+            anyhow::ensure!(
+                matches!(url.scheme(), "ws" | "wss") && url.host_str().is_some(),
+                "Invalid clnurl_nostr_relays entry: {relay}"
+            );
+            Ok(relay.to_owned())
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -218,18 +344,24 @@ async fn get_invoice(
     Query(params): Query<GetInvoiceParams>,
     State(state): State<ClnurlState>,
 ) -> Result<Json<GetInvoiceResponse>, StatusCode> {
+    if params.amount.msat() < state.min_sendable.msat()
+        || params.amount.msat() > state.max_sendable.msat()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let mut cln_client = cln_rpc::ClnRpc::new(&state.rpc_socket)
         .await
         .map_err(|_e| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let description = match &params.nostr {
         Some(d) => {
-            let zap_request: Event =
-                Event::from_json(d).map_err(|_e| StatusCode::INTERNAL_SERVER_ERROR)?;
-            zap_request
-                .verify()
-                .map_err(|_e| StatusCode::INTERNAL_SERVER_ERROR)?;
-            zap_request.as_json()
+            let zapper_pubkey = state.nostr_pubkey.ok_or(StatusCode::BAD_REQUEST)?;
+            nostr_zap::validate_zap_request(d, params.amount, zapper_pubkey).map_err(|err| {
+                log::warn!("Rejected invalid zap request: {err:#}");
+                StatusCode::BAD_REQUEST
+            })?;
+            d.clone()
         }
         None => serde_json::to_string(&vec![vec!["text/plain".to_string(), state.description]])
             .map_err(|_e| StatusCode::INTERNAL_SERVER_ERROR)?,

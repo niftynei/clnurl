@@ -47,7 +47,38 @@ clnurl = (import
 * `clnurl_min_sendable`: Min millisatoshi amount clnurl is willing to receive, can not be less than 1 or more than maxSendable. Defaults to `100`.
 * `clnurl_max_sendable`: Max millisatoshi amount clnurl is willing to receive. Defaults to `100000000000`
 * `clnurl_description`: Description used for all LNURLs, PRs to change that welcome. Defaults to `Gimme money!`
-* `clnurl_nostr_pubkey`: Nostr HEX pubkey of zapper
+* `clnurl_nostr_secret_path`: Path to a file containing a dedicated Nostr secret key (`nsec` or hex) used to sign NIP-57
+  zap receipts. This is the recommended way to configure the key; the file should be readable only by the CLN user.
+* `clnurl_nostr_secret`: Inline dedicated Nostr secret key used to sign zap receipts. Do not use this in Nix configuration,
+  since Nix strings are copied into the world-readable Nix store.
+* `clnurl_nostr_pubkey`: Optional hex or `npub` public key corresponding to the configured secret. If present, startup fails
+  when the keys do not match. The public key is derived automatically when this option is omitted.
+* `clnurl_nostr_relays`: Optional comma-separated fallback relays. Receipts are always sent to the secure `wss://` relays
+  requested by the zap sender as required by NIP-57.
+* `clnurl_pay_index_path`: File used to persist the last CLN pay index examined by the receipt publisher. Defaults to
+  `clnurl-zap-pay-index` beside the CLN RPC socket.
+
+## Nostr zaps
+
+Full NIP-57 support requires a dedicated signing key. For a normal installation, create a file containing only the `nsec`
+or 64-character hex secret, restrict it to the CLN user, and configure:
+
+```text
+clnurl_nostr_secret_path=/run/keys/clnurl-nostr-secret
+clnurl_nostr_relays=wss://relay.example.com
+```
+
+The extra relay is optional. Every valid zap request must provide at least one `wss://` relay, and `clnurl` publishes the
+receipt to those requested relays as well.
+
+When a signing key is configured, `clnurl` advertises `allowsNostr` and its derived `nostrPubkey`, validates kind `9734`
+requests, creates description-hash invoices, and watches CLN for settlement. A paid zap produces a signed kind `9735`
+receipt containing the original request, BOLT11 invoice, target tags, and payment preimage. The receipt timestamp uses CLN's
+`paid_at`, making its event ID stable if it is replayed after a restart.
+
+If the pay-index file does not exist, the publisher scans paid invoices from index zero. This backfills receipts for any
+valid zap invoices retained by CLN; relays deduplicate them by their deterministic event IDs. Configuring only the legacy
+`clnurl_nostr_pubkey` no longer advertises zap support, because a public key alone cannot sign the required receipts.
 
 ## Reverse proxying
 
