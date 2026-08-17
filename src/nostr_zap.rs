@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use cln_rpc::model::{WaitanyinvoiceRequest, WaitanyinvoiceResponse, WaitanyinvoiceStatus};
 use cln_rpc::primitives::Amount;
-use futures::{SinkExt, StreamExt};
+use futures::{stream::FuturesUnordered, SinkExt, StreamExt};
 use log::{debug, info, warn};
 use nostr::event::Event;
 use nostr::{ClientMessage, EventId, Keys, Kind, Tag, Timestamp, UnsignedEvent};
@@ -21,8 +21,22 @@ use url::Url;
 
 const MAX_RELAYS: usize = 20;
 const RELAY_TIMEOUT: Duration = Duration::from_secs(10);
-const PROXY_RELAY_TIMEOUT: Duration = Duration::from_secs(30);
-const RELAY_ATTEMPTS: usize = 3;
+const PROXY_RELAY_TIMEOUT: Duration = Duration::from_secs(12);
+const RECEIPT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
+const RELAY_ATTEMPTS: usize = 2;
+
+enum PublishError {
+    Retryable(anyhow::Error),
+    Permanent(anyhow::Error),
+}
+
+impl PublishError {
+    fn error(&self) -> &anyhow::Error {
+        match self {
+            Self::Retryable(error) | Self::Permanent(error) => error,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ValidatedZapRequest {
@@ -359,39 +373,83 @@ async fn publish_receipt(
     proxy: Option<&Socks5Proxy>,
     receipt: &Event,
 ) -> usize {
-    let futures = relays
+    let mut pending = relays
         .iter()
-        .map(|relay| publish_with_retry(relay, proxy, receipt));
-    futures::future::join_all(futures)
-        .await
-        .into_iter()
-        .filter(|published| *published)
-        .count()
+        .map(|relay| async move {
+            (
+                relay,
+                publish_with_retry(relay.as_str(), proxy, receipt).await,
+            )
+        })
+        .collect::<FuturesUnordered<_>>();
+    let deadline = tokio::time::sleep(RECEIPT_PUBLISH_TIMEOUT);
+    tokio::pin!(deadline);
+    let mut published = 0;
+
+    while !pending.is_empty() {
+        tokio::select! {
+            _ = &mut deadline => {
+                warn!(
+                    "Zap receipt {} publication deadline elapsed with {} relay(s) still pending",
+                    receipt.id.to_hex(),
+                    pending.len()
+                );
+                break;
+            }
+            result = pending.next() => {
+                if let Some((relay, true)) = result {
+                    published += 1;
+                    info!(
+                        "Published zap receipt {} to {relay}",
+                        receipt.id.to_hex()
+                    );
+                }
+            }
+        }
+    }
+
+    published
 }
 
 async fn publish_with_retry(relay: &str, proxy: Option<&Socks5Proxy>, receipt: &Event) -> bool {
     for attempt in 1..=RELAY_ATTEMPTS {
         match publish_once(relay, proxy, receipt).await {
             Ok(()) => return true,
+            Err(PublishError::Permanent(err)) => {
+                warn!("Could not publish zap receipt to {relay}: {err:#}");
+                return false;
+            }
             Err(err) if attempt < RELAY_ATTEMPTS => {
-                warn!("Could not publish zap receipt to {relay} (attempt {attempt}): {err:#}");
+                warn!(
+                    "Could not publish zap receipt to {relay} (attempt {attempt}): {:#}",
+                    err.error()
+                );
                 tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
             }
-            Err(err) => warn!("Could not publish zap receipt to {relay}: {err:#}"),
+            Err(err) => warn!(
+                "Could not publish zap receipt to {relay}: {:#}",
+                err.error()
+            ),
         }
     }
     false
 }
 
-async fn publish_once(relay: &str, proxy: Option<&Socks5Proxy>, receipt: &Event) -> Result<()> {
+async fn publish_once(
+    relay: &str,
+    proxy: Option<&Socks5Proxy>,
+    receipt: &Event,
+) -> std::result::Result<(), PublishError> {
     if let Some(proxy) = proxy {
-        let relay_url = Url::parse(relay).context("invalid relay URL")?;
+        let relay_url = Url::parse(relay)
+            .context("invalid relay URL")
+            .map_err(PublishError::Permanent)?;
         let relay_host = relay_url
             .host_str()
-            .ok_or_else(|| anyhow!("relay URL has no host"))?;
+            .ok_or_else(|| PublishError::Permanent(anyhow!("relay URL has no host")))?;
         let relay_port = relay_url
             .port_or_known_default()
-            .ok_or_else(|| anyhow!("relay URL has no port"))?;
+            .ok_or_else(|| PublishError::Permanent(anyhow!("relay URL has no port")))?;
         let connect = async {
             let stream = Socks5Stream::connect(proxy.address(), (relay_host, relay_port))
                 .await
@@ -402,25 +460,34 @@ async fn publish_once(relay: &str, proxy: Option<&Socks5Proxy>, receipt: &Event)
         };
         let (socket, _) = tokio::time::timeout(PROXY_RELAY_TIMEOUT, connect)
             .await
-            .context("relay connection through SOCKS5 proxy timed out")??;
+            .context("relay connection through SOCKS5 proxy timed out")
+            .and_then(|result| result)
+            .map_err(PublishError::Retryable)?;
         publish_on_socket(socket, receipt).await
     } else {
         let connect = tokio_tungstenite::connect_async(relay);
         let (socket, _) = tokio::time::timeout(RELAY_TIMEOUT, connect)
             .await
-            .context("relay connection timed out")??;
+            .context("relay connection timed out")
+            .and_then(|result| result.map_err(anyhow::Error::from))
+            .map_err(PublishError::Retryable)?;
         publish_on_socket(socket, receipt).await
     }
 }
 
-async fn publish_on_socket<S>(mut socket: WebSocketStream<S>, receipt: &Event) -> Result<()>
+async fn publish_on_socket<S>(
+    mut socket: WebSocketStream<S>,
+    receipt: &Event,
+) -> std::result::Result<(), PublishError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let message = ClientMessage::new_event(receipt.clone()).as_json();
     tokio::time::timeout(RELAY_TIMEOUT, socket.send(Message::Text(message)))
         .await
-        .context("relay write timed out")??;
+        .context("relay write timed out")
+        .and_then(|result| result.map_err(anyhow::Error::from))
+        .map_err(PublishError::Retryable)?;
 
     // NIP-20 OK responses are useful when available, but older relays may not
     // send one. Wait briefly, then treat a completed websocket write as success.
@@ -432,13 +499,13 @@ where
                 && value.get(1).and_then(|v| v.as_str()) == Some(&receipt.id.to_hex())
                 && value.get(2).and_then(|v| v.as_bool()) == Some(false)
             {
-                bail!(
+                return Err(PublishError::Permanent(anyhow!(
                     "relay rejected event: {}",
                     value
                         .get(3)
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown reason")
-                );
+                )));
             }
         }
     }

@@ -75,6 +75,9 @@ The extra relay and proxy are optional. Every valid zap request must provide at 
 publishes the receipt to those requested relays as well. `socks5h` keeps relay DNS resolution inside the proxy, which is
 appropriate for a Tor-isolated CLN service that can only reach a local SOCKS port.
 
+Relay publications run concurrently and are bounded to 30 seconds per receipt. Transient connection failures are retried
+once, while explicit relay rejections are not retried. Successful relay URLs are logged as soon as they accept a receipt.
+
 When a signing key is configured, `clnurl` advertises `allowsNostr` and its derived `nostrPubkey`, validates kind `9734`
 requests, creates description-hash invoices, and watches CLN for settlement. A paid zap produces a signed kind `9735`
 receipt containing the original request, BOLT11 invoice, target tags, and payment preimage. The receipt timestamp uses CLN's
