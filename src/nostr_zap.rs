@@ -6,7 +6,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use cln_rpc::model::{WaitanyinvoiceRequest, WaitanyinvoiceResponse, WaitanyinvoiceStatus};
+use cln_rpc::model::{
+    DatastoreMode, DatastoreRequest, ListdatastoreRequest, WaitanyinvoiceRequest,
+    WaitanyinvoiceResponse, WaitanyinvoiceStatus,
+};
 use cln_rpc::primitives::Amount;
 use futures::{stream::FuturesUnordered, SinkExt, StreamExt};
 use log::{debug, info, warn};
@@ -24,6 +27,7 @@ const RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 const PROXY_RELAY_TIMEOUT: Duration = Duration::from_secs(12);
 const RECEIPT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
 const RELAY_ATTEMPTS: usize = 2;
+const PAY_INDEX_DATASTORE_KEY: [&str; 3] = ["clnurl", "nostr", "pay_index"];
 
 enum PublishError {
     Retryable(anyhow::Error),
@@ -264,18 +268,15 @@ pub(crate) fn create_zap_receipt(
 pub(crate) async fn run_receipt_publisher(
     rpc_socket: PathBuf,
     keys: Keys,
-    pay_index_path: PathBuf,
+    legacy_pay_index_path: PathBuf,
     configured_relays: HashSet<String>,
     proxy: Option<Socks5Proxy>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
-    let mut last_pay_index = read_pay_index(&pay_index_path).unwrap_or_else(|err| {
-        info!("Starting zap receipt scan at pay index 0: {err}");
-        0
-    });
     let Some(mut rpc) = connect_cln(&rpc_socket, &mut shutdown).await else {
         return Ok(());
     };
+    let mut last_pay_index = initialize_pay_index(&mut rpc, &legacy_pay_index_path).await?;
 
     loop {
         let response = tokio::select! {
@@ -346,7 +347,7 @@ pub(crate) async fn run_receipt_publisher(
         }
 
         last_pay_index = pay_index;
-        if let Err(err) = write_pay_index(&pay_index_path, last_pay_index) {
+        if let Err(err) = write_pay_index(&mut rpc, last_pay_index).await {
             warn!("Could not persist zap pay index: {err:#}");
         }
     }
@@ -513,24 +514,93 @@ where
     Ok(())
 }
 
-fn read_pay_index(path: &Path) -> Result<u64> {
-    let bytes = fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
-    if bytes.len() != 8 {
-        bail!("invalid pay-index file length");
-    }
-    Ok(u64::from_be_bytes(
-        bytes.try_into().expect("length checked"),
-    ))
+fn pay_index_datastore_key() -> Vec<String> {
+    PAY_INDEX_DATASTORE_KEY
+        .iter()
+        .map(|component| (*component).to_owned())
+        .collect()
 }
 
-fn write_pay_index(path: &Path, index: u64) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+async fn read_pay_index(rpc: &mut cln_rpc::ClnRpc) -> Result<Option<u64>> {
+    let response = rpc
+        .call_typed(ListdatastoreRequest {
+            key: Some(pay_index_datastore_key()),
+        })
+        .await
+        .context("listdatastore failed")?;
+    let Some(entry) = response.datastore.into_iter().next() else {
+        return Ok(None);
+    };
+    let value = entry
+        .string
+        .ok_or_else(|| anyhow!("zap pay index datastore value is not a string"))?;
+    Ok(Some(parse_pay_index(&value)?))
+}
+
+fn read_legacy_pay_index(path: &Path) -> Result<Option<u64>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("could not read {}", path.display())),
+    };
+    if bytes.len() != 8 {
+        bail!("invalid legacy pay-index file length at {}", path.display());
     }
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, index.to_be_bytes())?;
-    fs::rename(&temporary, path)?;
+    Ok(Some(u64::from_be_bytes(
+        bytes.try_into().expect("length checked"),
+    )))
+}
+
+async fn initialize_pay_index(rpc: &mut cln_rpc::ClnRpc, legacy_path: &Path) -> Result<u64> {
+    let stored_index = read_pay_index(rpc).await?;
+    let legacy_index = read_legacy_pay_index(legacy_path)?;
+    let index = match (stored_index, legacy_index) {
+        (Some(stored), Some(legacy)) => stored.max(legacy),
+        (Some(stored), None) => stored,
+        (None, Some(legacy)) => legacy,
+        (None, None) => {
+            info!("No stored zap pay index; starting receipt scan at pay index 0");
+            return Ok(0);
+        }
+    };
+
+    if legacy_index.is_some() {
+        if stored_index != Some(index) {
+            write_pay_index(rpc, index).await?;
+        }
+        match fs::remove_file(legacy_path) {
+            Ok(()) => info!(
+                "Migrated zap pay index {index} to CLN datastore and removed {}",
+                legacy_path.display()
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => warn!(
+                "Zap pay index is stored in CLN datastore, but could not remove {}: {err}",
+                legacy_path.display()
+            ),
+        }
+    }
+
+    Ok(index)
+}
+
+async fn write_pay_index(rpc: &mut cln_rpc::ClnRpc, index: u64) -> Result<()> {
+    rpc.call_typed(DatastoreRequest {
+        key: pay_index_datastore_key(),
+        string: Some(index.to_string()),
+        hex: None,
+        mode: Some(DatastoreMode::CREATE_OR_REPLACE),
+        generation: None,
+    })
+    .await
+    .context("datastore failed")?;
     Ok(())
+}
+
+fn parse_pay_index(value: &str) -> Result<u64> {
+    value
+        .parse()
+        .context("zap pay index datastore value is not an integer")
 }
 
 #[cfg(test)]
@@ -665,5 +735,19 @@ mod tests {
         assert!(Socks5Proxy::parse("socks5://127.0.0.1:9050").is_err());
         assert!(Socks5Proxy::parse("http://127.0.0.1:9050").is_err());
         assert!(Socks5Proxy::parse("socks5h://user:password@127.0.0.1:9050").is_err());
+    }
+
+    #[test]
+    fn parses_datastore_pay_index() {
+        assert_eq!(parse_pay_index("42").unwrap(), 42);
+        assert!(parse_pay_index("not-an-index").is_err());
+    }
+
+    #[test]
+    fn parses_legacy_pay_index() {
+        let path = std::env::temp_dir().join(format!("clnurl-pay-index-{}", uuid::Uuid::new_v4()));
+        fs::write(&path, 42_u64.to_be_bytes()).unwrap();
+        assert_eq!(read_legacy_pay_index(&path).unwrap(), Some(42));
+        fs::remove_file(path).unwrap();
     }
 }

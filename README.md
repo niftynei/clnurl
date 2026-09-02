@@ -46,7 +46,8 @@ clnurl = (import
 * `clnurl_listen`: Internal listen address for the LNURL web server, defaults to `127.0.0.1:9876`
 * `clnurl_min_sendable`: Min millisatoshi amount clnurl is willing to receive, can not be less than 1 or more than maxSendable. Defaults to `100`.
 * `clnurl_max_sendable`: Max millisatoshi amount clnurl is willing to receive. Defaults to `100000000000`
-* `clnurl_description`: Description used for all LNURLs, PRs to change that welcome. Defaults to `Gimme money!`
+* `clnurl_description`: Description used for the legacy, unnamed `/lnurl` endpoint. Defaults to `Gimme money!`. Named
+  endpoints configured through the RPC interface have independent descriptions.
 * `clnurl_nostr_secret_path`: Path to a file containing a dedicated Nostr secret key (`nsec` or hex) used to sign NIP-57
   zap receipts. This is the recommended way to configure the key; the file should be readable only by the CLN user.
 * `clnurl_nostr_secret`: Inline dedicated Nostr secret key used to sign zap receipts. Do not use this in Nix configuration,
@@ -57,8 +58,28 @@ clnurl = (import
   requested by the zap sender as required by NIP-57.
 * `clnurl_nostr_proxy`: Optional SOCKS5 proxy for relay connections, written as `socks5h://host:port`. Relay hostnames are
   resolved by the proxy. Authentication is not supported.
-* `clnurl_pay_index_path`: File used to persist the last CLN pay index examined by the receipt publisher. Defaults to
-  `clnurl-zap-pay-index` beside the CLN RPC socket.
+* `clnurl_pay_index_path`: Deprecated. If the legacy pay-index file exists, its value is migrated to CLN's datastore and
+  the file is removed. The option remains temporarily so existing configurations can be migrated safely.
+
+## Named LNURL endpoints
+
+Named endpoints can be added, updated, removed, and listed while `clnurl` is running:
+
+```text
+lightning-cli clnurl-add name=alice description="Tips for Alice"
+lightning-cli clnurl-update name=alice description="Alice's new description"
+lightning-cli clnurl-list
+lightning-cli clnurl-remove name=alice
+```
+
+Endpoint names may contain lowercase letters, digits, `-`, `_`, and `.`, and are limited to 64 characters. Descriptions
+must be non-empty and are limited to 1024 UTF-8 bytes. Configurations are stored in CLN's datastore under
+`clnurl/endpoints/<name>` and loaded when the plugin starts.
+
+The public `/.well-known/lnurlp/<name>` route should be rewritten by the reverse proxy to `/lnurl/<name>`. The returned
+invoice callback includes the endpoint name and the exact metadata advertised to the wallet, so an in-flight payment
+continues to work if the endpoint's description is updated. Removing an endpoint disables both discovery and invoice
+callbacks for that name.
 
 ## Nostr zaps
 
@@ -83,9 +104,11 @@ requests, creates description-hash invoices, and watches CLN for settlement. A p
 receipt containing the original request, BOLT11 invoice, target tags, and payment preimage. The receipt timestamp uses CLN's
 `paid_at`, making its event ID stable if it is replayed after a restart.
 
-If the pay-index file does not exist, the publisher scans paid invoices from index zero. This backfills receipts for any
-valid zap invoices retained by CLN; relays deduplicate them by their deterministic event IDs. Configuring only the legacy
-`clnurl_nostr_pubkey` no longer advertises zap support, because a public key alone cannot sign the required receipts.
+The publisher stores its last examined CLN pay index in CLN's datastore under `clnurl/nostr/pay_index`. If that key does not
+exist, it scans paid invoices from index zero. This backfills receipts for any valid zap invoices retained by CLN; relays
+deduplicate them by their deterministic event IDs. Configuring only the legacy `clnurl_nostr_pubkey` no longer advertises
+zap support, because a public key alone cannot sign the required receipts. On the first startup after upgrading, any valid
+legacy pay-index file is copied into the datastore and deleted after the datastore write succeeds.
 
 ## Reverse proxying
 
@@ -105,12 +128,12 @@ services.nginx = {
       '';
 
     };
-    # If you also want to support LN Addresses you can add single handles like this
-    locations."=/.well-known/lnurlp/<you_user_name>" = {
-      proxyPass = "http://127.0.0.1:9876/lnurl";
-      # Just added allow origin since that helped with some nostr web clients
+    # Dynamically configured LN Address names are forwarded to /lnurl/<name>.
+    locations."~ ^/\\.well-known/lnurlp/([a-z0-9._-]+)$" = {
+      proxyPass = "http://127.0.0.1:9876";
       extraConfig = ''
-        add_header Access-Control-Allow-Origin *;
+        rewrite ^/\.well-known/lnurlp/([a-z0-9._-]+)$ /lnurl/$1 break;
+        add_header Access-Control-Allow-Origin * always;
       '';
     };
   };

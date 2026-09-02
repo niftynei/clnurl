@@ -1,10 +1,11 @@
 //! A mostly reverse-engineered implementation of LNURLPay following <https://bolt.fun/guide/web-services/lnurl/pay>
+mod endpoints;
 mod nostr_zap;
 
 use std::collections::HashSet;
 use std::str::FromStr;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -26,7 +27,7 @@ use uuid::Uuid;
 async fn main() -> anyhow::Result<()> {
     let (shutdown_sender, _) = tokio::sync::broadcast::channel::<()>(1);
     let plugin_shutdown_sender = shutdown_sender.clone();
-    let plugin = if let Some(plugin) = cln_plugin::Builder::new(stdin(), stdout())
+    let configured_plugin = if let Some(plugin) = cln_plugin::Builder::new(stdin(), stdout())
         .option(ConfigOption::new(
             "clnurl_listen",
             Value::String("127.0.0.1:9876".into()),
@@ -82,8 +83,28 @@ async fn main() -> anyhow::Result<()> {
         .option(ConfigOption::new(
             "clnurl_pay_index_path",
             Value::OptString,
-            "File used to persist the last processed CLN pay index",
+            "Deprecated legacy pay-index file; its value is migrated to CLN's datastore and the file is removed",
         ))
+        .rpcmethod(
+            "clnurl-add",
+            "Add a named LNURL-pay endpoint",
+            endpoints::rpc_add,
+        )
+        .rpcmethod(
+            "clnurl-update",
+            "Update a named LNURL-pay endpoint",
+            endpoints::rpc_update,
+        )
+        .rpcmethod(
+            "clnurl-remove",
+            "Remove a named LNURL-pay endpoint",
+            endpoints::rpc_remove,
+        )
+        .rpcmethod(
+            "clnurl-list",
+            "List named LNURL-pay endpoints",
+            endpoints::rpc_list,
+        )
         .subscribe("shutdown", move |_, _| {
             let shutdown_sender_inner = plugin_shutdown_sender.clone();
             async move {
@@ -92,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
             }
         })
         .dynamic()
-        .start(())
+        .configure()
         .await?
     {
         plugin
@@ -100,7 +121,9 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    let rpc_socket: PathBuf = plugin.configuration().rpc_file.parse()?;
+    let rpc_socket: PathBuf = configured_plugin.configuration().rpc_file.parse()?;
+    let endpoints = endpoints::EndpointRegistry::load(&rpc_socket).await?;
+    let plugin = configured_plugin.start(endpoints.clone()).await?;
     let listen_addr: SocketAddr = plugin
         .option("clnurl_listen")
         .expect("Option is defined")
@@ -214,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
-    let pay_index_path = match plugin.option("clnurl_pay_index_path") {
+    let legacy_pay_index_path = match plugin.option("clnurl_pay_index_path") {
         Some(Value::String(path)) => PathBuf::from(path),
         Some(Value::OptString) | None => rpc_socket.with_file_name("clnurl-zap-pay-index"),
         _ => rpc_socket.with_file_name("clnurl-zap-pay-index"),
@@ -227,11 +250,14 @@ async fn main() -> anyhow::Result<()> {
         max_sendable: Amount::from_msat(max_sendable as u64),
         description,
         nostr_pubkey,
+        endpoints,
     };
 
     let lnurl_service = Router::new()
         .route("/lnurl", get(get_lnurl_struct))
+        .route("/lnurl/:name", get(get_named_lnurl_struct))
         .route("/invoice", get(get_invoice))
+        .route("/invoice/:name", get(get_named_invoice))
         .with_state(state.clone());
 
     let publisher = zapper_keys.map(|keys| {
@@ -241,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
             if let Err(err) = nostr_zap::run_receipt_publisher(
                 rpc_socket,
                 keys,
-                pay_index_path,
+                legacy_pay_index_path,
                 configured_relays,
                 nostr_proxy,
                 shutdown,
@@ -294,6 +320,7 @@ struct ClnurlState {
     max_sendable: Amount,
     description: String,
     nostr_pubkey: Option<XOnlyPublicKey>,
+    endpoints: endpoints::EndpointRegistry,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -335,11 +362,32 @@ async fn get_lnurl_struct(
     }))
 }
 
+async fn get_named_lnurl_struct(
+    Path(name): Path<String>,
+    State(state): State<ClnurlState>,
+) -> Result<Json<LnurlResponse>, StatusCode> {
+    let endpoint = state
+        .endpoints
+        .get(&name)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let metadata = endpoint_metadata(&endpoint.description)?;
+    let mut callback = state
+        .api_base_address
+        .join(&format!("invoice/{name}"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    callback
+        .query_pairs_mut()
+        .append_pair("metadata", &metadata);
+    Ok(Json(lnurl_response(&state, metadata, callback)))
+}
+
 #[derive(Serialize, Deserialize)]
 struct GetInvoiceParams {
     #[serde(with = "as_msat")]
     amount: Amount,
     nostr: Option<String>,
+    metadata: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -355,6 +403,29 @@ struct GetInvoiceResponse {
 async fn get_invoice(
     Query(params): Query<GetInvoiceParams>,
     State(state): State<ClnurlState>,
+) -> Result<Json<GetInvoiceResponse>, StatusCode> {
+    create_invoice(params, state, None).await
+}
+
+async fn get_named_invoice(
+    Path(name): Path<String>,
+    Query(params): Query<GetInvoiceParams>,
+    State(state): State<ClnurlState>,
+) -> Result<Json<GetInvoiceResponse>, StatusCode> {
+    state
+        .endpoints
+        .get(&name)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let metadata = params.metadata.clone().ok_or(StatusCode::BAD_REQUEST)?;
+    validate_endpoint_metadata(&metadata).map_err(|_| StatusCode::BAD_REQUEST)?;
+    create_invoice(params, state, Some(metadata)).await
+}
+
+async fn create_invoice(
+    params: GetInvoiceParams,
+    state: ClnurlState,
+    advertised_metadata: Option<String>,
 ) -> Result<Json<GetInvoiceResponse>, StatusCode> {
     if params.amount.msat() < state.min_sendable.msat()
         || params.amount.msat() > state.max_sendable.msat()
@@ -375,8 +446,10 @@ async fn get_invoice(
             })?;
             d.clone()
         }
-        None => serde_json::to_string(&vec![vec!["text/plain".to_string(), state.description]])
-            .map_err(|_e| StatusCode::INTERNAL_SERVER_ERROR)?,
+        None => match advertised_metadata {
+            Some(metadata) => metadata,
+            None => endpoint_metadata(&state.description)?,
+        },
     };
 
     let cln_response = cln_client
@@ -404,6 +477,39 @@ async fn get_invoice(
         success_action: None,
         routes: vec![],
     }))
+}
+
+fn endpoint_metadata(description: &str) -> Result<String, StatusCode> {
+    serde_json::to_string(&vec![vec![
+        "text/plain".to_string(),
+        description.to_owned(),
+    ]])
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn validate_endpoint_metadata(metadata: &str) -> anyhow::Result<()> {
+    let entries: Vec<Vec<String>> = serde_json::from_str(metadata)?;
+    anyhow::ensure!(
+        entries.len() == 1
+            && entries[0].len() == 2
+            && entries[0][0] == "text/plain"
+            && !entries[0][1].is_empty()
+            && entries[0][1].len() <= 1024,
+        "invalid endpoint metadata"
+    );
+    Ok(())
+}
+
+fn lnurl_response(state: &ClnurlState, metadata: String, callback: Url) -> LnurlResponse {
+    LnurlResponse {
+        min_sendable: state.min_sendable,
+        max_sendable: state.max_sendable,
+        metadata,
+        callback,
+        tag: LnurlTag::PayRequest,
+        allows_nostr: state.nostr_pubkey.is_some(),
+        nostr_pubkey: state.nostr_pubkey,
+    }
 }
 
 pub mod as_msat {
@@ -454,5 +560,42 @@ mod tests {
         };
 
         assert_eq!("{\"minSendable\":0,\"maxSendable\":1000000,\"metadata\":\"[[\\\"text/plain\\\",\\\"Hello world\\\"]]\",\"callback\":\"http://example.com/\",\"tag\":\"payRequest\",\"allowsNostr\":true,\"nostrPubkey\":\"9630f464cca6a5147aa8a35f0bcdd3ce485324e732fd39e09233b1d848238f31\"}", serde_json::to_string(&lnurl_response).unwrap());
+    }
+
+    #[tokio::test]
+    async fn named_lnurl_uses_endpoint_description_and_callback() {
+        let endpoints = endpoints::EndpointRegistry::default();
+        endpoints.insert_for_test("alice", "Tips for Alice").await;
+        let state = ClnurlState {
+            rpc_socket: PathBuf::from("/tmp/lightning-rpc"),
+            api_base_address: Url::parse("https://example.com/lnurl_api/").unwrap(),
+            min_sendable: Amount::from_msat(100),
+            max_sendable: Amount::from_msat(1_000_000),
+            description: "Legacy".to_owned(),
+            nostr_pubkey: None,
+            endpoints,
+        };
+
+        let response = get_named_lnurl_struct(Path("alice".to_owned()), State(state.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(response.metadata, "[[\"text/plain\",\"Tips for Alice\"]]");
+        assert_eq!(response.callback.path(), "/lnurl_api/invoice/alice");
+        assert_eq!(
+            response
+                .callback
+                .query_pairs()
+                .find(|(key, _)| key == "metadata")
+                .map(|(_, value)| value.into_owned()),
+            Some(response.metadata)
+        );
+
+        assert_eq!(
+            get_named_lnurl_struct(Path("missing".to_owned()), State(state))
+                .await
+                .unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
     }
 }
