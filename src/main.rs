@@ -5,7 +5,8 @@ mod nostr_zap;
 use std::collections::HashSet;
 use std::str::FromStr;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Host, Path, Query, State};
+use axum::http::uri::Authority;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -364,6 +365,7 @@ async fn get_lnurl_struct(
 
 async fn get_named_lnurl_struct(
     Path(name): Path<String>,
+    Host(host): Host,
     State(state): State<ClnurlState>,
 ) -> Result<Json<LnurlResponse>, StatusCode> {
     let endpoint = state
@@ -371,7 +373,7 @@ async fn get_named_lnurl_struct(
         .get(&name)
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
-    let metadata = endpoint_metadata(&endpoint.description)?;
+    let metadata = named_endpoint_metadata(&endpoint.description, &name, &host)?;
     let mut callback = state
         .api_base_address
         .join(&format!("invoice/{name}"))
@@ -418,7 +420,7 @@ async fn get_named_invoice(
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
     let metadata = params.metadata.clone().ok_or(StatusCode::BAD_REQUEST)?;
-    validate_endpoint_metadata(&metadata).map_err(|_| StatusCode::BAD_REQUEST)?;
+    validate_named_endpoint_metadata(&metadata, &name).map_err(|_| StatusCode::BAD_REQUEST)?;
     create_invoice(params, state, Some(metadata)).await
 }
 
@@ -487,14 +489,36 @@ fn endpoint_metadata(description: &str) -> Result<String, StatusCode> {
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-fn validate_endpoint_metadata(metadata: &str) -> anyhow::Result<()> {
+fn named_endpoint_metadata(
+    description: &str,
+    name: &str,
+    host: &str,
+) -> Result<String, StatusCode> {
+    let authority = Authority::from_str(host).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let domain = authority.host().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    serde_json::to_string(&vec![
+        vec!["text/plain".to_owned(), description.to_owned()],
+        vec!["text/identifier".to_owned(), format!("{name}@{domain}")],
+    ])
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn validate_named_endpoint_metadata(metadata: &str, name: &str) -> anyhow::Result<()> {
     let entries: Vec<Vec<String>> = serde_json::from_str(metadata)?;
+    let identifier_prefix = format!("{name}@");
     anyhow::ensure!(
-        entries.len() == 1
+        entries.len() == 2
             && entries[0].len() == 2
             && entries[0][0] == "text/plain"
             && !entries[0][1].is_empty()
-            && entries[0][1].len() <= 1024,
+            && entries[0][1].len() <= 1024
+            && entries[1].len() == 2
+            && entries[1][0] == "text/identifier"
+            && entries[1][1].starts_with(&identifier_prefix)
+            && entries[1][1].len() > identifier_prefix.len(),
         "invalid endpoint metadata"
     );
     Ok(())
@@ -576,11 +600,18 @@ mod tests {
             endpoints,
         };
 
-        let response = get_named_lnurl_struct(Path("alice".to_owned()), State(state.clone()))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(response.metadata, "[[\"text/plain\",\"Tips for Alice\"]]");
+        let response = get_named_lnurl_struct(
+            Path("alice".to_owned()),
+            Host("Tips.Example.com:443".to_owned()),
+            State(state.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            response.metadata,
+            "[[\"text/plain\",\"Tips for Alice\"],[\"text/identifier\",\"alice@tips.example.com\"]]"
+        );
         assert_eq!(response.callback.path(), "/lnurl_api/invoice/alice");
         assert_eq!(
             response
@@ -592,10 +623,22 @@ mod tests {
         );
 
         assert_eq!(
-            get_named_lnurl_struct(Path("missing".to_owned()), State(state))
-                .await
-                .unwrap_err(),
+            get_named_lnurl_struct(
+                Path("missing".to_owned()),
+                Host("tips.example.com".to_owned()),
+                State(state),
+            )
+            .await
+            .unwrap_err(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[test]
+    fn validates_named_metadata_identifier() {
+        let metadata = "[[\"text/plain\",\"Tips\"],[\"text/identifier\",\"alice@example.com\"]]";
+        validate_named_endpoint_metadata(metadata, "alice").unwrap();
+        assert!(validate_named_endpoint_metadata(metadata, "bob").is_err());
+        assert!(validate_named_endpoint_metadata("[[\"text/plain\",\"Tips\"]]", "alice").is_err());
     }
 }

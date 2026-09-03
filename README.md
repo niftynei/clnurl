@@ -77,9 +77,11 @@ must be non-empty and are limited to 1024 UTF-8 bytes. Configurations are stored
 `clnurl/endpoints/<name>` and loaded when the plugin starts.
 
 The public `/.well-known/lnurlp/<name>` route should be rewritten by the reverse proxy to `/lnurl/<name>`. The returned
-invoice callback includes the endpoint name and the exact metadata advertised to the wallet, so an in-flight payment
-continues to work if the endpoint's description is updated. Removing an endpoint disables both discovery and invoice
-callbacks for that name.
+metadata contains both the configured `text/plain` description and a LUD-16 `text/identifier` derived from the requested
+host, such as `alice@example.com`. The invoice callback includes the endpoint name and the exact metadata advertised to the
+wallet, so an in-flight payment continues to work if the endpoint's description is updated. Removing an endpoint disables
+both discovery and invoice callbacks for that name. The reverse proxy must preserve the original `Host` header; NixOS'
+`recommendedProxySettings` does this by default.
 
 ## Nostr zaps
 
